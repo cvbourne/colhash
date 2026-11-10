@@ -1,4 +1,4 @@
-"""Per-column content hashing for parquet files.
+"""Per-column content hashing for parquet files, plus a column-by-column diff.
 
 Hashes are over values, not bytes on disk: the same data written with a different
 compression codec, row-group size, dictionary encoding, or row order (when a key is
@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass, field
+from enum import Enum
 
 import numpy as np
 import pyarrow as pa
@@ -130,3 +131,146 @@ def hash_file(path: str, key: list[str] | None = None) -> FileHash:
         rows=table.num_rows,
         columns={name: column_hash(table.column(name)) for name in table.column_names},
     )
+
+
+# ---------------------------------------------------------------------------- diff
+
+
+class Verdict(str, Enum):
+    IDENTICAL = "identical"
+    WITHIN_BAND = "within_band"
+    CHANGED = "changed"
+    MISSING = "missing"
+
+
+@dataclass
+class ColumnDiff:
+    column: str
+    identical: bool
+    n_diff: int
+    max_abs: float | None = None  # None for non-numeric columns; inf when a null or NaN meets a value
+    type_a: str | None = None
+    type_b: str | None = None
+    missing_in: str | None = None  # "a" or "b" when the column exists in only one file
+
+
+@dataclass
+class DiffReport:
+    a: str
+    b: str
+    key: list[str]
+    rows_a: int
+    rows_b: int
+    rows_matched: int
+    only_in_a: int
+    only_in_b: int
+    columns: list[ColumnDiff]
+
+    @property
+    def identical(self) -> bool:
+        return self.only_in_a == 0 and self.only_in_b == 0 and all(c.identical for c in self.columns)
+
+
+def _check_key(table: pa.Table, path: str, key: list[str]) -> None:
+    missing = [k for k in key if k not in table.column_names]
+    if missing:
+        raise KeyError(f"{path}: key column(s) not found: {missing}")
+    for k in key:
+        if table.column(k).null_count:
+            raise ValueError(f"{path}: key column {k!r} contains nulls")
+    unique = table.select(key).group_by(key).aggregate([]).num_rows
+    if unique != table.num_rows:
+        raise ValueError(f"{path}: duplicate values in key {key}; the key must identify a row")
+
+
+def _align(ta: pa.Table, tb: pa.Table, key: list[str]):
+    """Row positions in each table for the rows whose key appears in both."""
+    pos_a, pos_b = "__colhash_pos_a", "__colhash_pos_b"
+    left = ta.select(key).append_column(pos_a, pa.array(np.arange(ta.num_rows, dtype=np.int64)))
+    right = tb.select(key).append_column(pos_b, pa.array(np.arange(tb.num_rows, dtype=np.int64)))
+    both = left.join(right, keys=key, join_type="inner")
+    return both.column(pos_a).to_numpy(), both.column(pos_b).to_numpy()
+
+
+def _compare(a: pa.Array, b: pa.Array) -> tuple[int, float | None]:
+    """(rows that differ, largest absolute difference) for two aligned arrays of one type."""
+    t = a.type
+    na = a.is_null().to_numpy(zero_copy_only=False)
+    nb = b.is_null().to_numpy(zero_copy_only=False)
+    null_mismatch = na != nb
+    both_valid = ~na & ~nb
+
+    if pa.types.is_floating(t) or pa.types.is_integer(t):
+        xa = a.fill_null(0).to_numpy(zero_copy_only=False)
+        xb = b.fill_null(0).to_numpy(zero_copy_only=False)
+        if pa.types.is_floating(t):
+            nan_a, nan_b = np.isnan(xa), np.isnan(xb)
+            nan_mismatch = both_valid & (nan_a != nan_b)
+            ne = both_valid & ~nan_a & ~nan_b & (xa != xb)  # NaN == NaN, -0.0 == 0.0
+        else:
+            nan_mismatch = np.zeros(len(a), dtype=bool)
+            ne = both_valid & (xa != xb)  # exact integer comparison
+        differs = null_mismatch | nan_mismatch | ne
+        n = int(differs.sum())
+        if n == 0:
+            return 0, 0.0
+        if (null_mismatch | nan_mismatch).any():
+            return n, float("inf")  # a value against a null or NaN has no finite magnitude
+        return n, float(np.abs(xa[ne].astype(np.float64) - xb[ne].astype(np.float64)).max())
+
+    # No magnitude for strings, booleans, timestamps or nested types: equal or not.
+    try:
+        ne = pc.fill_null(pc.not_equal(a, b), False).to_numpy(zero_copy_only=False)
+    except (pa.ArrowNotImplementedError, pa.ArrowInvalid):
+        ne = np.array([x != y for x, y in zip(a.to_pylist(), b.to_pylist(), strict=True)], dtype=bool)
+    return int((null_mismatch | (both_valid & ne)).sum()), None
+
+
+def diff_report(a: str, b: str, key: list[str]) -> DiffReport:
+    """Compare two files column by column, aligned on `key`.
+
+    Rows are matched on the key (inner join); rows found in only one file are counted
+    separately. A duplicate or null key raises, because there is no honest way to guess.
+    """
+    if not key:
+        raise ValueError("diff needs a key that identifies a row")
+    ta, tb = pq.read_table(a), pq.read_table(b)
+    _check_key(ta, a, key)
+    _check_key(tb, b, key)
+    pa_idx, pb_idx = _align(ta, tb, key)
+    matched = len(pa_idx)
+
+    cols: list[ColumnDiff] = []
+    names_a, names_b = ta.column_names, tb.column_names
+    for name in names_a:
+        if name in key:
+            continue
+        if name not in names_b:
+            cols.append(ColumnDiff(name, False, 0, None, str(ta.schema.field(name).type), None, "b"))
+            continue
+        ca = _flat(ta.column(name).take(pa.array(pa_idx)))
+        cb = _flat(tb.column(name).take(pa.array(pb_idx)))
+        type_a, type_b = str(ca.type), str(cb.type)
+        if ca.type != cb.type:
+            # A changed type is a change even when the numbers agree.
+            try:
+                n, mx = _compare(ca, cb.cast(ca.type))
+            except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
+                n, mx = matched, None
+            cols.append(ColumnDiff(name, False, n, mx, type_a, type_b))
+            continue
+        n, mx = _compare(ca, cb)
+        cols.append(ColumnDiff(name, n == 0, n, mx, type_a, type_b))
+    for name in names_b:
+        if name not in names_a and name not in key:
+            cols.append(ColumnDiff(name, False, 0, None, None, str(tb.schema.field(name).type), "a"))
+
+    return DiffReport(
+        a=a, b=b, key=list(key), rows_a=ta.num_rows, rows_b=tb.num_rows, rows_matched=matched,
+        only_in_a=ta.num_rows - matched, only_in_b=tb.num_rows - matched, columns=cols,
+    )
+
+
+def diff(a: str, b: str, key: list[str]) -> list[ColumnDiff]:
+    """Per-column comparison of two files aligned on `key` (see `diff_report`)."""
+    return diff_report(a, b, key).columns

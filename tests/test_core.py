@@ -58,3 +58,14 @@ def test_missing_key_raises(tmp_path):
     a = _write(tmp_path, "a.parquet", _table())
     with pytest.raises(KeyError):
         core.hash_file(a, ["frame"])
+
+
+# diff: the spec from SCOPE.md.
+
+def test_diff_counts_changed_rows(tmp_path):
+    a = _write(tmp_path, "a.parquet", _table())
+    b = _write(tmp_path, "b.parquet", _table(score=pa.array([0.5, 1.5, -2.0])))
+    by_col = {d.column: d for d in core.diff(a, b, ["id"])}
+    assert by_col["score"].n_diff == 1
+    assert by_col["score"].max_abs == pytest.approx(0.25)
+    assert by_col["label"].identical
