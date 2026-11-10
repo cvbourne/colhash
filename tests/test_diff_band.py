@@ -6,6 +6,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from colhash import core
+from colhash.core import Verdict
 
 
 def write(tmp_path, name, **cols):
@@ -132,3 +133,85 @@ def test_diff_handles_empty_files(tmp_path):
     empty = {"id": pa.array([], pa.int64()), "x": pa.array([], pa.float64())}
     a, b = write(tmp_path, "a.parquet", **empty), write(tmp_path, "b.parquet", **empty)
     assert core.diff_report(a, b, ["id"]).identical
+
+
+# ---- band
+
+def noisy(tmp_path, name, x):
+    return write(tmp_path, name, **base(x=pa.array(x)))
+
+
+def test_band_identical_when_candidate_matches_baseline(tmp_path):
+    b1 = noisy(tmp_path, "b1.parquet", [1.0, 2.0, 3.0, 4.0])
+    b2 = noisy(tmp_path, "b2.parquet", [1.0, 2.0, 3.0 + 1e-9, 4.0])
+    c = noisy(tmp_path, "c.parquet", [1.0, 2.0, 3.0, 4.0])
+    assert core.band(b1, b2, c, ["id"])["x"] == Verdict.IDENTICAL
+
+
+def test_band_needs_both_magnitude_and_count(tmp_path):
+    # Noise: one row moves by 1e-6.
+    b1 = noisy(tmp_path, "b1.parquet", [1.0, 2.0, 3.0, 4.0])
+    b2 = noisy(tmp_path, "b2.parquet", [1.0, 2.0, 3.0 + 1e-6, 4.0])
+    # Many rows move by less than the noise magnitude: too many rows.
+    many = noisy(tmp_path, "many.parquet", [1.0 + 1e-8, 2.0 + 1e-8, 3.0 + 1e-8, 4.0])
+    # One row moves by far more than the noise: too large.
+    big = noisy(tmp_path, "big.parquet", [1.0, 2.0, 3.0 + 1e-3, 4.0])
+    fine = noisy(tmp_path, "fine.parquet", [1.0, 2.0 + 1e-7, 3.0, 4.0])
+    verdicts = {n: core.band(b1, b2, p, ["id"])["x"] for n, p in
+                [("many", many), ("big", big), ("fine", fine)]}
+    assert verdicts == {"many": Verdict.CHANGED, "big": Verdict.CHANGED, "fine": Verdict.WITHIN_BAND}
+
+
+def test_deterministic_baseline_has_a_zero_band(tmp_path):
+    b1 = noisy(tmp_path, "b1.parquet", [1.0, 2.0, 3.0, 4.0])
+    b2 = noisy(tmp_path, "b2.parquet", [1.0, 2.0, 3.0, 4.0])
+    c = noisy(tmp_path, "c.parquet", [1.0, 2.0, 3.0 + 1e-12, 4.0])
+    assert core.band(b1, b2, c, ["id"])["x"] == Verdict.CHANGED
+
+
+def test_tol_is_an_absolute_floor(tmp_path):
+    b1 = noisy(tmp_path, "b1.parquet", [1.0, 2.0, 3.0, 4.0])
+    b2 = noisy(tmp_path, "b2.parquet", [1.0, 2.0, 3.0, 4.0])
+    c = noisy(tmp_path, "c.parquet", [1.0 + 1e-9, 2.0 + 1e-9, 3.0 + 1e-9, 4.0 + 1e-9])
+    assert core.band(b1, b2, c, ["id"])["x"] == Verdict.CHANGED
+    assert core.band(b1, b2, c, ["id"], tol=1e-6)["x"] == Verdict.WITHIN_BAND
+
+
+def test_non_numeric_column_is_identical_or_changed_unless_baseline_varies(tmp_path):
+    b1 = write(tmp_path, "b1.parquet", **base())
+    b2 = write(tmp_path, "b2.parquet", **base())
+    c = write(tmp_path, "c.parquet", **base(s=pa.array(["a", "b", "c", "X"])))
+    assert core.band(b1, b2, c, ["id"])["s"] == Verdict.CHANGED
+    b2v = write(tmp_path, "b2v.parquet", **base(s=pa.array(["a", "b", "Y", "d"])))
+    assert core.band(b1, b2v, c, ["id"])["s"] == Verdict.WITHIN_BAND  # one row varies on its own
+
+
+def test_missing_and_extra_columns(tmp_path):
+    b1 = write(tmp_path, "b1.parquet", **base())
+    b2 = write(tmp_path, "b2.parquet", **base())
+    c = write(tmp_path, "c.parquet", id=base()["id"], x=base()["x"], new=pa.array([1, 2, 3, 4]))
+    v = core.band(b1, b2, c, ["id"])
+    assert v["s"] == Verdict.MISSING and v["new"] == Verdict.MISSING and v["x"] == Verdict.IDENTICAL
+
+
+def test_changed_type_is_changed(tmp_path):
+    b1 = write(tmp_path, "b1.parquet", **base(x=pa.array([1, 2, 3, 4], pa.int32())))
+    b2 = write(tmp_path, "b2.parquet", **base(x=pa.array([1, 2, 3, 4], pa.int32())))
+    c = write(tmp_path, "c.parquet", **base(x=pa.array([1, 2, 3, 4], pa.int64())))
+    assert core.band(b1, b2, c, ["id"])["x"] == Verdict.CHANGED
+
+
+def test_different_row_set_is_a_change_in_every_column(tmp_path):
+    b1 = write(tmp_path, "b1.parquet", **base())
+    b2 = write(tmp_path, "b2.parquet", **base())
+    c = write(tmp_path, "c.parquet", **{k: v.take([0, 1, 2]) for k, v in base().items()})
+    report = core.band_report(b1, b2, c, ["id"])
+    assert report.rows_changed and report.failed
+    assert set(report.verdicts.values()) == {Verdict.CHANGED}
+
+
+def test_baselines_with_different_columns_raise(tmp_path):
+    b1 = write(tmp_path, "b1.parquet", **base())
+    b2 = write(tmp_path, "b2.parquet", id=base()["id"], x=base()["x"])
+    with pytest.raises(ValueError, match="baseline"):
+        core.band(b1, b2, b1, ["id"])

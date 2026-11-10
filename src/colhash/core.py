@@ -1,4 +1,4 @@
-"""Per-column content hashing for parquet files, plus a column-by-column diff.
+"""Per-column content hashing for parquet files, plus diff and noise-band checks.
 
 Hashes are over values, not bytes on disk: the same data written with a different
 compression codec, row-group size, dictionary encoding, or row order (when a key is
@@ -274,3 +274,86 @@ def diff_report(a: str, b: str, key: list[str]) -> DiffReport:
 def diff(a: str, b: str, key: list[str]) -> list[ColumnDiff]:
     """Per-column comparison of two files aligned on `key` (see `diff_report`)."""
     return diff_report(a, b, key).columns
+
+
+# ---------------------------------------------------------------------------- band
+
+
+@dataclass
+class BandColumn:
+    column: str
+    verdict: Verdict
+    n_diff: int  # candidate vs baseline
+    max_abs: float | None
+    noise_n_diff: int  # baseline vs baseline
+    noise_max_abs: float | None
+
+
+@dataclass
+class BandReport:
+    columns: list[BandColumn]
+    rows_changed: bool  # the candidate has more unmatched rows than the baseline's own noise explains
+
+    @property
+    def verdicts(self) -> dict[str, Verdict]:
+        return {c.column: c.verdict for c in self.columns}
+
+    @property
+    def failed(self) -> bool:
+        return any(c.verdict in (Verdict.CHANGED, Verdict.MISSING) for c in self.columns)
+
+
+def band_report(base1: str, base2: str, candidate: str, key: list[str], tol: float = 0.0) -> BandReport:
+    """Classify each column of `candidate` against the baseline's own run-to-run noise.
+
+    1. diff(base1, base2) measures how much the unchanged pipeline varies on its own.
+    2. diff(base1, candidate) measures how far the change moved the output.
+    3. Per column:
+         IDENTICAL    same values and type as base1
+         WITHIN_BAND  differs, but in no more rows and by no larger a difference than the noise
+         CHANGED      outside the band, or the type changed: a real change that needs review
+         MISSING      the column was added or removed
+
+    Both measures are needed. Noise that touches many rows by a tiny amount and a change
+    that hits a few rows by a lot are different things. Judging on max_abs alone would pass
+    a change that moved many rows by a little; judging on n_diff alone would pass a change
+    that moved one row by a lot. A column is within the band only if it passes both.
+
+    `tol` is an absolute floor: a numeric difference no larger than `tol` is never flagged.
+    Non-numeric columns have no magnitude, so only the row count is compared, and only when
+    the baseline itself varies on that column. A deterministic baseline has a band of zero,
+    so any difference is CHANGED.
+    """
+    noise = diff_report(base1, base2, key)
+    if any(c.missing_in for c in noise.columns):
+        raise ValueError("the two baseline runs have different columns; they are not the same pipeline")
+    cand = diff_report(base1, candidate, key)
+    noise_by_col = {c.column: c for c in noise.columns}
+
+    rows_changed = (cand.only_in_a + cand.only_in_b) > (noise.only_in_a + noise.only_in_b)
+
+    out: list[BandColumn] = []
+    for c in cand.columns:
+        nz = noise_by_col.get(c.column)
+        nz_n = nz.n_diff if nz else 0
+        nz_max = nz.max_abs if nz else None
+        if c.missing_in:
+            verdict = Verdict.MISSING
+        elif c.identical:
+            verdict = Verdict.CHANGED if rows_changed else Verdict.IDENTICAL
+        elif rows_changed or c.type_a != c.type_b:
+            verdict = Verdict.CHANGED
+        elif c.max_abs is not None and c.max_abs <= tol:
+            verdict = Verdict.WITHIN_BAND
+        elif c.max_abs is None:
+            verdict = Verdict.WITHIN_BAND if 0 < nz_n and c.n_diff <= nz_n else Verdict.CHANGED
+        else:
+            inside = c.n_diff <= nz_n and nz_max is not None and c.max_abs <= nz_max
+            verdict = Verdict.WITHIN_BAND if inside else Verdict.CHANGED
+        out.append(BandColumn(c.column, verdict, c.n_diff, c.max_abs, nz_n, nz_max))
+    return BandReport(columns=out, rows_changed=rows_changed)
+
+
+def band(base1: str, base2: str, candidate: str, key: list[str], tol: float = 0.0) -> dict[str, Verdict]:
+    """Per-column verdicts (see `band_report`)."""
+    return band_report(base1, base2, candidate, key, tol).verdicts

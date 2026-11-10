@@ -60,7 +60,7 @@ def test_missing_key_raises(tmp_path):
         core.hash_file(a, ["frame"])
 
 
-# diff: the spec from SCOPE.md.
+# diff and band: the two specs from SCOPE.md.
 
 def test_diff_counts_changed_rows(tmp_path):
     a = _write(tmp_path, "a.parquet", _table())
@@ -69,3 +69,13 @@ def test_diff_counts_changed_rows(tmp_path):
     assert by_col["score"].n_diff == 1
     assert by_col["score"].max_abs == pytest.approx(0.25)
     assert by_col["label"].identical
+
+
+def test_band_separates_noise_from_change(tmp_path):
+    base1 = _write(tmp_path, "b1.parquet", _table())
+    base2 = _write(tmp_path, "b2.parquet", _table(score=pa.array([0.5, 1.25, -2.0 + 1e-6])))
+    noisy = _write(tmp_path, "c1.parquet", _table(score=pa.array([0.5 + 1e-7, 1.25, -2.0])))
+    changed = _write(tmp_path, "c2.parquet", _table(score=pa.array([0.5, 1.75, -2.0])))
+    assert core.band(base1, base2, noisy, ["id"])["score"] == core.Verdict.WITHIN_BAND
+    assert core.band(base1, base2, changed, ["id"])["score"] == core.Verdict.CHANGED
+    assert core.band(base1, base2, changed, ["id"])["label"] == core.Verdict.IDENTICAL
